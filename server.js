@@ -50,7 +50,7 @@ app.post('/webhook', async (req, res) => {
   const discordMessage = {
     embeds: [
       {
-        title: `🚨 [${repoName}] '${branch}' 브랜치에 새 푸시(또는 리베이스) 발생!`,
+        title: `🚨 [${repoName}] '${branch}' 브랜치에 푸쉬가 발생하였습니다`,
         url: payload.compare,
         color: 0x2ECC71, // 초록색
         fields: [
