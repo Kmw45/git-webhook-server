@@ -38,13 +38,27 @@ app.post('/webhook', async (req, res) => {
     return res.status(200).send('No commits');
   }
 
-  // 커밋 메시지 요약
+  // 커밋 목록 가공 (제목 + Description 상세 설명 포함)
   const commitListText = commits
     .slice(0, 5) // 최대 5개까지만 표시
-    .map(c => `• [${c.id.substring(0, 7)}] ${c.message.split('\n')[0]} (${c.author.name})`)
-    .join('\n');
+    .map(c => {
+      const lines = c.message.split('\n').map(l => l.trim()).filter(Boolean);
+      const title = lines[0] || 'No commit message'; // 첫번째 줄: 커밋 제목
+      const bodyLines = lines.slice(1); // 두번째 줄 이하: Description(상세설명)
 
-  const extraCount = commits.length > 5 ? `\n...외 ${commits.length - 5}개 커밋` : '';
+      let result = `• [${c.id.substring(0, 7)}] **${title}** (${c.author.name})`;
+      
+      // Description(본문)이 존재하는 경우 들여쓰기하여 추가
+      if (bodyLines.length > 0) {
+        const descriptionText = bodyLines.map(line => `> ${line}`).join('\n');
+        result += `\n${descriptionText}`;
+      }
+
+      return result;
+    })
+    .join('\n\n');
+
+  const extraCount = commits.length > 5 ? `\n\n...외 ${commits.length - 5}개 커밋` : '';
 
   // 디스코드 메시지 양식
   const discordMessage = {
