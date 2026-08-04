@@ -9,7 +9,11 @@ const PORT = process.env.PORT || 3000;
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
 // ★ 알림을 받을 메인 브랜치 이름 (필요 시 'dev' 추가 가능)
-const TARGET_BRANCHES = ['main', 'master']; 
+const TARGET_BRANCHES = ['main', 'master'];
+
+app.get('/', (req, res) => {
+  res.status(200).send('Server is alive!');
+}); 
 
 app.post('/webhook', async (req, res) => {
   const event = req.headers['x-github-event'];
