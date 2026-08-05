@@ -8,80 +8,111 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
-// ★ 알림을 받을 메인 브랜치 이름 (필요 시 'dev' 추가 가능)
-const TARGET_BRANCHES = ['main', 'master'];
+// ★ 알림을 보낼 PR action 목록
+//   opened          : 새 PR 생성
+//   reopened        : 닫혔던 PR 다시 열림
+//   ready_for_review: 드래프트(초안) → 리뷰 준비 상태로 전환
+const NOTIFY_ACTIONS = ['opened', 'reopened', 'ready_for_review'];
+
+// ★ 특정 브랜치로 향하는 PR만 받고 싶다면 여기에 base 브랜치를 넣으세요.
+//   비워두면([]) 모든 PR에 대해 알림이 옵니다.
+//   예: ['main', 'develop']
+const TARGET_BASE_BRANCHES = [];
 
 app.get('/', (req, res) => {
   res.status(200).send('Server is alive!');
-}); 
+});
 
 app.post('/webhook', async (req, res) => {
   const event = req.headers['x-github-event'];
 
-  // 1. Push 이벤트가 아니면 무시
-  if (event !== 'push') {
-    return res.status(200).send('Ignored non-push event');
+  // 1. Pull Request 이벤트가 아니면 무시 (push 알림은 더 이상 보내지 않음)
+  if (event !== 'pull_request') {
+    return res.status(200).send('Ignored non-PR event');
   }
 
   const payload = req.body;
-  // refs/heads/main -> main 문자열만 추출
-  const branch = payload.ref ? payload.ref.replace('refs/heads/', '') : '';
+  const action = payload.action;
+  const pr = payload.pull_request;
 
-  // 2. main(또는 master) 브랜치가 아니면 알림 안 보내고 무시!
-  if (!TARGET_BRANCHES.includes(branch)) {
-    console.log(`[무시됨] '${branch}' 브랜치 푸시는 디스코드로 보내지 않습니다.`);
-    return res.status(200).send('Ignored branch');
+  if (!pr) {
+    return res.status(200).send('No pull_request payload');
   }
 
-  // 3. 디스코드로 보낼 알림 내용 가공
-  const pusher = payload.pusher.name; // 푸시한 사람
-  const repoName = payload.repository.full_name; // 레포 이름
-  const commits = payload.commits || [];
+  const baseBranch = pr.base ? pr.base.ref : '';
+  const headBranch = pr.head ? pr.head.ref : '';
 
-  if (commits.length === 0) {
-    return res.status(200).send('No commits');
+  // 2. base 브랜치 필터 (설정된 경우에만 동작)
+  if (TARGET_BASE_BRANCHES.length > 0 && !TARGET_BASE_BRANCHES.includes(baseBranch)) {
+    console.log(`[무시됨] base 브랜치 '${baseBranch}' 는 알림 대상이 아닙니다.`);
+    return res.status(200).send('Ignored base branch');
   }
 
-  // 커밋 목록 가공 (제목 + Description 상세 설명 포함)
-  const commitListText = commits
-    .slice(0, 5) // 최대 5개까지만 표시
-    .map(c => {
-      const lines = c.message.split('\n').map(l => l.trim()).filter(Boolean);
-      const title = lines[0] || 'No commit message'; // 첫번째 줄: 커밋 제목
-      const bodyLines = lines.slice(1); // 두번째 줄 이하: Description(상세설명)
+  // PR 작성자 / 이 이벤트를 실제로 발생시킨 사람(머지·닫기를 누른 사람)
+  const author = pr.user ? pr.user.login : 'unknown';
+  const actor = payload.sender ? payload.sender.login : author;
 
-      let result = `• [${c.id.substring(0, 7)}] **${title}** (${c.author.name})`;
-      
-      // Description(본문)이 존재하는 경우 들여쓰기하여 추가
-      if (bodyLines.length > 0) {
-        const descriptionText = bodyLines.map(line => `> ${line}`).join('\n');
-        result += `\n${descriptionText}`;
-      }
+  // 3. action 종류에 따라 알림 유형 결정
+  //    ↓↓↓ 머지/닫힘 알림이 필요 없으면 아래 closed 분기를 지우면 됩니다 ↓↓↓
+  let heading;
+  let color;
 
-      return result;
-    })
-    .join('\n\n');
+  if (NOTIFY_ACTIONS.includes(action)) {
+    heading = `🔀 ${author} 님이 Pull Request 요청을 보냈습니다`;
+    color = 0x2ECC71; // 초록색
+  } else if (action === 'closed' && pr.merged) {
+    heading = `✅ ${actor} 님이 Pull Request를 머지했습니다`;
+    color = 0x8E44AD; // 보라색
+  } else if (action === 'closed' && !pr.merged) {
+    heading = `❌ ${actor} 님이 Pull Request를 닫았습니다`;
+    color = 0xE74C3C; // 빨간색
+  } else {
+    // 그 외 action(assigned, labeled, synchronize 등)은 무시
+    console.log(`[무시됨] '${action}' action 은 알림 대상이 아닙니다.`);
+    return res.status(200).send('Ignored PR action');
+  }
+  // ↑↑↑ 여기까지 ↑↑↑
 
-  const extraCount = commits.length > 5 ? `\n\n...외 ${commits.length - 5}개 커밋` : '';
+  const repoName = payload.repository.full_name;
+  const prNumber = pr.number;
+  const prTitle = pr.title || 'No title';
+
+  // PR 본문(Description) 가공 — Discord 필드 값은 최대 1024자
+  let bodyText = (pr.body || '').trim();
+  if (bodyText.length > 1000) {
+    bodyText = bodyText.substring(0, 1000) + '\n...(생략)';
+  }
+  if (!bodyText) {
+    bodyText = '(설명 없음)';
+  }
 
   // 디스코드 메시지 양식
   const discordMessage = {
     embeds: [
       {
-        title: `🚨 [${repoName}] '${branch}' 브랜치에 푸쉬가 발생하였습니다`,
-        url: payload.compare,
-        color: 0x2ECC71, // 초록색
+        title: `${heading}  #${prNumber}`,
+        description: `**${prTitle}**`,
+        url: pr.html_url,
+        color: color,
         fields: [
           {
-            name: '작업자',
-            value: pusher,
+            name: '작성자',
+            value: author,
             inline: true,
           },
           {
-            name: `포함된 커밋 (${commits.length}개)`,
-            value: `${commitListText}${extraCount}`,
+            name: '브랜치',
+            value: `\`${headBranch}\` → \`${baseBranch}\``,
+            inline: true,
+          },
+          {
+            name: '설명',
+            value: bodyText,
           },
         ],
+        footer: {
+          text: repoName,
+        },
         timestamp: new Date().toISOString(),
       },
     ],
@@ -90,7 +121,7 @@ app.post('/webhook', async (req, res) => {
   // 4. 디스코드로 전송
   try {
     await axios.post(DISCORD_WEBHOOK_URL, discordMessage);
-    console.log(`[성공] '${branch}' 브랜치 푸시 알림을 디스코드로 보냈습니다.`);
+    console.log(`[성공] PR #${prNumber} (${action}) 알림을 디스코드로 보냈습니다.`);
     res.status(200).send('OK');
   } catch (err) {
     console.error('[에러] 디스코드 전송 실패:', err.message);
