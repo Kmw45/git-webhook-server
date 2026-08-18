@@ -19,6 +19,51 @@ const NOTIFY_ACTIONS = ['opened', 'reopened', 'ready_for_review'];
 //   예: ['main', 'develop']
 const TARGET_BASE_BRANCHES = [];
 
+// ─────────────────────────────────────────────────────────
+// 디스코드 전송 큐 + 429(레이트리밋) 재시도
+//   - 디스코드 웹훅은 URL당 대략 2초에 5회 정도의 요청 제한이 있음
+//   - 여러 PR 이벤트가 짧은 시간에 몰려도 순서대로, 최소 간격을 두고 전송
+//   - 429가 오면 응답의 retry_after(초)만큼 대기 후 자동 재시도
+// ─────────────────────────────────────────────────────────
+const MIN_SEND_INTERVAL_MS = 500; // 전송 사이 최소 간격 (약 초당 2회로 제한)
+const MAX_RETRIES = 5;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+let sendQueue = Promise.resolve();
+
+async function sendToDiscordWithRetry(message, retriesLeft = MAX_RETRIES) {
+  try {
+    await axios.post(DISCORD_WEBHOOK_URL, message);
+  } catch (err) {
+    const status = err.response ? err.response.status : null;
+
+    if (status === 429 && retriesLeft > 0) {
+      const retryAfterSec =
+        (err.response.data && err.response.data.retry_after) || 1;
+      const waitMs = Math.ceil(retryAfterSec * 1000) + 250; // 여유 250ms 추가
+      console.warn(
+        `[429] 디스코드 레이트리밋. ${waitMs}ms 후 재시도합니다. (남은 재시도: ${retriesLeft})`
+      );
+      await sleep(waitMs);
+      return sendToDiscordWithRetry(message, retriesLeft - 1);
+    }
+
+    // 429가 아니거나 재시도를 모두 소진한 경우 그대로 에러를 던짐
+    throw err;
+  }
+}
+
+// 모든 디스코드 전송을 하나의 큐로 직렬화 + 최소 간격 보장
+function enqueueDiscordSend(message) {
+  const task = sendQueue.then(() => sendToDiscordWithRetry(message));
+
+  // 다음 작업은 이번 작업의 성공/실패와 무관하게 최소 간격 후 진행
+  sendQueue = task.catch(() => {}).then(() => sleep(MIN_SEND_INTERVAL_MS));
+
+  return task;
+}
+
 app.get('/', (req, res) => {
   res.status(200).send('Server is alive!');
 });
@@ -118,9 +163,9 @@ app.post('/webhook', async (req, res) => {
     ],
   };
 
-  // 4. 디스코드로 전송
+  // 4. 디스코드로 전송 (큐 + 429 재시도 적용)
   try {
-    await axios.post(DISCORD_WEBHOOK_URL, discordMessage);
+    await enqueueDiscordSend(discordMessage);
     console.log(`[성공] PR #${prNumber} (${action}) 알림을 디스코드로 보냈습니다.`);
     res.status(200).send('OK');
   } catch (err) {
