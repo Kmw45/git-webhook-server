@@ -164,14 +164,20 @@ app.post('/webhook', async (req, res) => {
   };
 
   // 4. 디스코드로 전송 (큐 + 429 재시도 적용)
-  try {
-    await enqueueDiscordSend(discordMessage);
-    console.log(`[성공] PR #${prNumber} (${action}) 알림을 디스코드로 보냈습니다.`);
-    res.status(200).send('OK');
-  } catch (err) {
-    console.error('[에러] 디스코드 전송 실패:', err.message);
-    res.status(500).send('Error');
-  }
+  //    GitHub 웹훅은 10초 안에 응답이 없으면 전송 실패로 처리한다.
+  //    큐 대기나 429 재시도를 기다리다 보면 그 시간을 넘기고, 실패로 뜬 걸
+  //    Redeliver 하면 같은 알림이 중복으로 쌓여 429 를 더 유발한다.
+  //    그래서 응답을 먼저 보내고 전송은 백그라운드로 돌린다.
+  res.status(200).send('OK');
+
+  enqueueDiscordSend(discordMessage)
+    .then(() => {
+      console.log(`[성공] PR #${prNumber} (${action}) 알림을 디스코드로 보냈습니다.`);
+    })
+    .catch((err) => {
+      // 이미 응답을 보낸 뒤라 res 를 다시 건드리면 ERR_HTTP_HEADERS_SENT 가 난다.
+      console.error('[에러] 디스코드 전송 실패:', err.message);
+    });
 });
 
 app.listen(PORT, () => {
