@@ -21,16 +21,67 @@ const TARGET_BASE_BRANCHES = [];
 
 // ─────────────────────────────────────────────────────────
 // 디스코드 전송 큐 + 429(레이트리밋) 재시도
-//   - 디스코드 웹훅은 URL당 대략 2초에 5회 정도의 요청 제한이 있음
+//   - 디스코드 웹훅 예산은 채널당 대략 60초에 30건. 재시도도 요청으로 계산되므로
+//     간격이 짧으면 429 를 벗어나려는 재시도가 오히려 429 를 만든다.
 //   - 여러 PR 이벤트가 짧은 시간에 몰려도 순서대로, 최소 간격을 두고 전송
-//   - 429가 오면 응답의 retry_after(초)만큼 대기 후 자동 재시도
+//   - 429가 오면 응답이 알려주는 대기 시간만큼 쉬고 재시도. 응답에 아무 정보도
+//     없으면(Cloudflare 차단 등) 지수 백오프로 물러난다.
 // ─────────────────────────────────────────────────────────
-const MIN_SEND_INTERVAL_MS = 500; // 전송 사이 최소 간격 (약 초당 2회로 제한)
+const MIN_SEND_INTERVAL_MS = 2000; // 디스코드 웹훅 예산(60초/30건)에 맞춘 간격
 const MAX_RETRIES = 5;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let sendQueue = Promise.resolve();
+
+// 429 의 정체를 로그로 남긴다.
+//   content-type 이 text/html 이면 디스코드 API 가 아니라 앞단 Cloudflare 차단이다.
+//   application/json 이면서 body 에 retry_after 가 있으면 정식 레이트리밋이다.
+function logRateLimitDetails(err) {
+  const h = (err.response && err.response.headers) || {};
+  const body = err.response && err.response.data;
+
+  console.warn('[429 진단] content-type:', h['content-type']);
+  console.warn('[429 진단] retry-after 헤더:', h['retry-after']);
+  console.warn(
+    '[429 진단] scope:', h['x-ratelimit-scope'],
+    '| reset-after:', h['x-ratelimit-reset-after'],
+    '| bucket:', h['x-ratelimit-bucket']
+  );
+  console.warn(
+    '[429 진단] body:',
+    typeof body === 'string' ? body.slice(0, 300) : JSON.stringify(body)
+  );
+}
+
+// 429 응답에서 대기 시간을 뽑아낸다. 정보가 없으면 지수 백오프로 물러난다.
+//   attempt 는 몇 번째 시도인지(1 부터). 폴백 대기가 2 → 4 → 8 → 16 → 32초로 늘어난다.
+function resolveWaitMs(err, attempt) {
+  const headers = (err.response && err.response.headers) || {};
+  const body = err.response && err.response.data;
+  let sec = null;
+
+  // 1) 본문 retry_after (초, 소수 가능) — 디스코드 정식 레이트리밋 응답
+  if (body && typeof body.retry_after === 'number') {
+    sec = body.retry_after;
+  }
+  // 2) Retry-After 헤더 (초) — Cloudflare 차단은 여기에만 들어온다
+  if (sec === null && headers['retry-after']) {
+    const n = Number(headers['retry-after']);
+    if (!Number.isNaN(n)) sec = n;
+  }
+  // 3) x-ratelimit-reset-after (초, 소수)
+  if (sec === null && headers['x-ratelimit-reset-after']) {
+    const n = Number(headers['x-ratelimit-reset-after']);
+    if (!Number.isNaN(n)) sec = n;
+  }
+  // 4) 아무 정보도 없으면 지수 백오프 (최대 60초). 고정 간격으로 계속 때리지 않는다.
+  if (sec === null) {
+    sec = Math.min(2 ** attempt, 60);
+  }
+
+  return Math.ceil(sec * 1000) + 250; // 여유 250ms 추가
+}
 
 async function sendToDiscordWithRetry(message, retriesLeft = MAX_RETRIES) {
   try {
@@ -38,10 +89,13 @@ async function sendToDiscordWithRetry(message, retriesLeft = MAX_RETRIES) {
   } catch (err) {
     const status = err.response ? err.response.status : null;
 
+    if (status === 429) {
+      logRateLimitDetails(err);
+    }
+
     if (status === 429 && retriesLeft > 0) {
-      const retryAfterSec =
-        (err.response.data && err.response.data.retry_after) || 1;
-      const waitMs = Math.ceil(retryAfterSec * 1000) + 250; // 여유 250ms 추가
+      const attempt = MAX_RETRIES - retriesLeft + 1;
+      const waitMs = resolveWaitMs(err, attempt);
       console.warn(
         `[429] 디스코드 레이트리밋. ${waitMs}ms 후 재시도합니다. (남은 재시도: ${retriesLeft})`
       );
