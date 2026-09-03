@@ -30,6 +30,13 @@ const TARGET_BASE_BRANCHES = [];
 const MIN_SEND_INTERVAL_MS = 2000; // 디스코드 웹훅 예산(60초/30건)에 맞춘 간격
 const MAX_RETRIES = 5;
 
+// 재시도까지 이보다 오래 기다려야 하면 포기한다.
+//   정상적인 레이트리밋은 몇 초 안에 풀리므로 1분이면 넉넉하다.
+//   반면 전역 차단(global rate limit)은 30분~1시간짜리라 여기 걸린다.
+//   기다려서 보내봤자 한참 지난 알림이 뒤늦게 도착할 뿐이고,
+//   그동안 큐가 잠겨 뒤에 오는 알림까지 전부 밀린다.
+const MAX_WAIT_MS = 60000;
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let sendQueue = Promise.resolve();
@@ -96,6 +103,17 @@ async function sendToDiscordWithRetry(message, retriesLeft = MAX_RETRIES) {
     if (status === 429 && retriesLeft > 0) {
       const attempt = MAX_RETRIES - retriesLeft + 1;
       const waitMs = resolveWaitMs(err, attempt);
+
+      // 상한을 넘으면 재시도하지 않고 이 알림만 버린다. 큐를 즉시 비워서
+      // 차단이 풀린 뒤에 오는 알림들이 정상적으로 나가게 하는 것이 목적이다.
+      if (waitMs > MAX_WAIT_MS) {
+        console.error(
+          `[429] 전역 차단으로 약 ${Math.round(waitMs / 60000)}분 대기가 필요합니다. ` +
+          `뒤늦은 알림을 보내지 않기 위해 이 건은 버립니다.`
+        );
+        throw err;
+      }
+
       console.warn(
         `[429] 디스코드 레이트리밋. ${waitMs}ms 후 재시도합니다. (남은 재시도: ${retriesLeft})`
       );
